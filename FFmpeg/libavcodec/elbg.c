@@ -30,7 +30,7 @@
 #include "libavutil/lfg.h"
 #include "libavutil/mem.h"
 #include "elbg.h"
-
+#include <arm_neon.h>
 #define DELTA_ERR_MAX 0.1  ///< Precision of the ELBG algorithm (as percentage error)
 
 /**
@@ -87,6 +87,35 @@ static inline int distance_limited(int *a, int *b, int dim, int limit)
     return dist;
 }
 
+static inline int distance_6(int *a, int *b)
+{
+    int32x4_t i32x4_a, i32x4_b, i32x4_result;
+    int32x2_t i32x2_a, i32x2_b, i32x2_result;
+    int diff;
+    
+    i32x4_a = vld1q_s32(a);
+    i32x2_a = vld1_s32(&a[4]);
+    i32x4_b = vld1q_s32(b);
+    i32x2_b = vld1_s32(&b[4]);
+    i32x4_result = vsubq_s32(i32x4_a, i32x4_b);
+    i32x2_result = vsub_s32(i32x2_a, i32x2_b);
+    i32x4_result = vmulq_s32(i32x4_result, i32x4_result);
+    i32x2_result = vmul_s32(i32x2_result, i32x2_result);
+    diff = vaddvq_s32(i32x4_result) + vaddv_s32(i32x2_result);
+    return diff;
+}
+
+static inline int distance_4(int *a, int *b)
+{
+    int32x4_t i32x4_a, i32x4_b, i32x4_result;
+    
+    i32x4_a = vld1q_s32(a);
+    i32x4_b = vld1q_s32(b);
+    i32x4_result = vsubq_s32(i32x4_a, i32x4_b);
+    i32x4_result = vmulq_s32(i32x4_result, i32x4_result);
+    return vaddvq_s32(i32x4_result);
+}
+
 static inline void vect_division(int *res, int *vect, int div, int dim)
 {
     int i;
@@ -101,11 +130,20 @@ static inline void vect_division(int *res, int *vect, int div, int dim)
 static int eval_error_cell(ELBGContext *elbg, int *centroid, cell *cells)
 {
     int error=0;
-    for (; cells; cells=cells->next) {
-        int distance = distance_limited(centroid, elbg->points + cells->index*elbg->dim, elbg->dim, INT_MAX);
-        if (error >= INT_MAX - distance)
-            return INT_MAX;
-        error += distance;
+    if (elbg->dim == 6) {
+        for (; cells; cells=cells->next) {
+            int distance = distance_6(centroid, elbg->points + cells->index * elbg->dim);
+            if (error >= INT_MAX - distance)
+                return INT_MAX;
+            error += distance;
+        }
+    } else { // dim == 4
+        for (; cells; cells=cells->next) {
+            int distance = distance_4(centroid, elbg->points + cells->index * elbg->dim);
+            if (error >= INT_MAX - distance)
+                return INT_MAX;
+            error += distance;
+        }
     }
 
     return error;
@@ -114,15 +152,33 @@ static int eval_error_cell(ELBGContext *elbg, int *centroid, cell *cells)
 static int get_closest_codebook(ELBGContext *elbg, int index)
 {
     int pick = 0;
-    for (int i = 0, diff_min = INT_MAX; i < elbg->num_cb; i++)
+    int32x4_t i32x4_src, i32x4_dst, i32x4_result;
+    int32x2_t i32x2_src, i32x2_dst, i32x2_result;
+    int *src, *dest;
+    const int dim = elbg->dim;
+    
+    src = elbg->codebook + index * elbg->dim;
+    dest = elbg->codebook;
+    i32x4_src = vld1q_s32(src);
+    i32x2_src = vld1_s32(&src[4]);
+    for (int i = 0, diff_min = INT_MAX; i < elbg->num_cb; i++) {
         if (i != index) {
             int diff;
-            diff = distance_limited(elbg->codebook + i*elbg->dim, elbg->codebook + index*elbg->dim, elbg->dim, diff_min);
+            //            diff = distance_limited(elbg->codebook + i*elbg->dim, elbg->codebook + index*elbg->dim, elbg->dim, diff_min);
+            i32x4_dst = vld1q_s32(dest);
+            i32x2_dst = vld1_s32(&dest[4]);
+            i32x4_result = vsubq_s32(i32x4_src, i32x4_dst);
+            i32x2_result = vsub_s32(i32x2_src, i32x2_dst);
+            i32x4_result = vmulq_s32(i32x4_result, i32x4_result);
+            i32x2_result = vmul_s32(i32x2_result, i32x2_result);
+            diff = vaddvq_s32(i32x4_result) + vaddv_s32(i32x2_result);
             if (diff < diff_min) {
                 pick = i;
                 diff_min = diff;
             }
         }
+        dest += dim;
+    }
     return pick;
 }
 
@@ -171,25 +227,45 @@ static int simple_lbg(ELBGContext *elbg,
     newutility[0] =
     newutility[1] = 0;
 
-    for (tempcell = cells; tempcell; tempcell=tempcell->next) {
-        idx = distance_limited(centroid[0], points + tempcell->index*dim, dim, INT_MAX)>=
-              distance_limited(centroid[1], points + tempcell->index*dim, dim, INT_MAX);
-        numpoints[idx]++;
-        for (i=0; i<dim; i++)
-            newcentroid[idx][i] += points[tempcell->index*dim + i];
+    if (dim == 6) {
+        for (tempcell = cells; tempcell; tempcell=tempcell->next) {
+            idx = distance_6(centroid[0], points + tempcell->index*dim) >= distance_6(centroid[1], points + tempcell->index*dim);
+            numpoints[idx]++;
+            for (i=0; i<dim; i++)
+                newcentroid[idx][i] += points[tempcell->index*dim + i];
+        }
+    } else { // dim == 4
+        for (tempcell = cells; tempcell; tempcell=tempcell->next) {
+            idx = distance_4(centroid[0], points + tempcell->index*dim) >= distance_4(centroid[1], points + tempcell->index*dim);
+            numpoints[idx]++;
+            for (i=0; i<dim; i++)
+                newcentroid[idx][i] += points[tempcell->index*dim + i];
+        }
     }
 
     vect_division(centroid[0], newcentroid[0], numpoints[0], dim);
     vect_division(centroid[1], newcentroid[1], numpoints[1], dim);
 
-    for (tempcell = cells; tempcell; tempcell=tempcell->next) {
-        int dist[2] = {distance_limited(centroid[0], points + tempcell->index*dim, dim, INT_MAX),
-                       distance_limited(centroid[1], points + tempcell->index*dim, dim, INT_MAX)};
-        int idx = dist[0] > dist[1];
-        if (newutility[idx] >= INT_MAX - dist[idx])
-            newutility[idx] = INT_MAX;
-        else
-            newutility[idx] += dist[idx];
+    if (dim == 6) {
+        for (tempcell = cells; tempcell; tempcell=tempcell->next) {
+            int dist[2] = {distance_6(centroid[0], points + tempcell->index*dim),
+                distance_6(centroid[1], points + tempcell->index*dim)};
+            int idx = dist[0] > dist[1];
+            if (newutility[idx] >= INT_MAX - dist[idx])
+                newutility[idx] = INT_MAX;
+            else
+                newutility[idx] += dist[idx];
+        }
+    } else {  // dim == 4
+        for (tempcell = cells; tempcell; tempcell=tempcell->next) {
+            int dist[2] = {distance_4(centroid[0], points + tempcell->index*dim),
+                distance_4(centroid[1], points + tempcell->index*dim)};
+            int idx = dist[0] > dist[1];
+            if (newutility[idx] >= INT_MAX - dist[idx])
+                newutility[idx] = INT_MAX;
+            else
+                newutility[idx] += dist[idx];
+        }
     }
 
     return (newutility[0] >= INT_MAX - newutility[1]) ? INT_MAX : newutility[0] + newutility[1];
@@ -246,16 +322,22 @@ static void shift_codebook(ELBGContext *elbg, int *indexes,
     tempdata = elbg->cells[indexes[1]];
     elbg->cells[indexes[1]] = NULL;
 
-    while(tempdata) {
-        cell *tempcell2 = tempdata->next;
-        int idx = distance_limited(elbg->points + tempdata->index*elbg->dim,
-                           newcentroid[0], elbg->dim, INT_MAX) >
-                  distance_limited(elbg->points + tempdata->index*elbg->dim,
-                           newcentroid[1], elbg->dim, INT_MAX);
-
-        tempdata->next = elbg->cells[indexes[idx]];
-        elbg->cells[indexes[idx]] = tempdata;
-        tempdata = tempcell2;
+    if (elbg->dim == 6) {
+        while(tempdata) {
+            cell *tempcell2 = tempdata->next;
+            int idx = distance_6(elbg->points + tempdata->index*elbg->dim, newcentroid[0]) > distance_6(elbg->points + tempdata->index*elbg->dim, newcentroid[1]);
+            tempdata->next = elbg->cells[indexes[idx]];
+            elbg->cells[indexes[idx]] = tempdata;
+            tempdata = tempcell2;
+        }
+    }  else { // dim == 4
+        while(tempdata) {
+            cell *tempcell2 = tempdata->next;
+            int idx = distance_4(elbg->points + tempdata->index*elbg->dim, newcentroid[0]) > distance_4(elbg->points + tempdata->index*elbg->dim, newcentroid[1]);
+            tempdata->next = elbg->cells[indexes[idx]];
+            elbg->cells[indexes[idx]] = tempdata;
+            tempdata = tempcell2;
+        }
     }
 }
 
@@ -375,6 +457,10 @@ static void do_elbg(ELBGContext *restrict elbg, int *points, int numpoints,
 
     do {
         cell *free_cells = elbg->cell_buffer;
+        /* keep frequently used structure vars in locals to avoid unnecessary point dereferences in the inner loop */
+        int *src, *dest;
+        const int dim = elbg->dim;
+        const int num_cb = elbg->num_cb;
         last_error = elbg->error;
         steps++;
         memset(elbg->utility, 0, elbg->num_cb * sizeof(*elbg->utility));
@@ -384,28 +470,81 @@ static void do_elbg(ELBGContext *restrict elbg, int *points, int numpoints,
 
         /* This loop evaluate the actual Voronoi partition. It is the most
            costly part of the algorithm. */
-        for (i=0; i < numpoints; i++) {
-            int best_dist = distance_limited(elbg->points   + i * elbg->dim,
-                                             elbg->codebook + best_idx * elbg->dim,
-                                             elbg->dim, INT_MAX);
-            for (int k = 0; k < elbg->num_cb; k++) {
-                int dist = distance_limited(elbg->points   + i * elbg->dim,
-                                            elbg->codebook + k * elbg->dim,
-                                            elbg->dim, best_dist);
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best_idx = k;
+        src = elbg->points;
+        if (dim == 6) {
+            for (i=0; i < numpoints; i++) {
+                int32x4_t i32x4_src, i32x4_dst, i32x4_result;
+                int32x2_t i32x2_src, i32x2_dst, i32x2_result;
+                int dist, best_dist;
+                
+                dest = elbg->codebook;
+                //           best_dist = distance_limited(src, elbg->codebook + best_idx * dim, dim, INT_MAX);
+                best_dist = INT_MAX;
+                i32x4_src = vld1q_s32(src);
+                i32x2_src = vld1_s32(&src[4]);
+                for (int k = 0; k < num_cb; k++) {
+                    //                int dist = distance_limited(src, dest, dim, best_dist);
+                    i32x4_dst = vld1q_s32(dest);
+                    i32x2_dst = vld1_s32(&dest[4]);
+                    i32x4_result = vsubq_s32(i32x4_src, i32x4_dst);
+                    i32x2_result = vsub_s32(i32x2_src, i32x2_dst);
+                    i32x4_result = vmulq_s32(i32x4_result, i32x4_result);
+                    i32x2_result = vmul_s32(i32x2_result, i32x2_result);
+                    dist = vaddvq_s32(i32x4_result) + vaddv_s32(i32x2_result);
+                    if (dist < best_dist) {
+                        best_dist = dist;
+                        best_idx = k;
+                        if (best_dist == 0) { // can't be better than a perfect match
+                            k = num_cb; // break out of the loop
+                        }
+                    }
+                    dest += dim;
                 }
-            }
-            elbg->nearest_cb[i] = best_idx;
-            elbg->error = (elbg->error >= INT_MAX - best_dist) ? INT_MAX : elbg->error + best_dist;
-            elbg->utility[elbg->nearest_cb[i]] = (elbg->utility[elbg->nearest_cb[i]] >= INT_MAX - best_dist) ?
-                                                  INT_MAX : elbg->utility[elbg->nearest_cb[i]] + best_dist;
-            free_cells->index = i;
-            free_cells->next = elbg->cells[elbg->nearest_cb[i]];
-            elbg->cells[elbg->nearest_cb[i]] = free_cells;
-            free_cells++;
-        }
+                elbg->nearest_cb[i] = best_idx;
+                elbg->error = (elbg->error >= INT_MAX - best_dist) ? INT_MAX : elbg->error + best_dist;
+                elbg->utility[elbg->nearest_cb[i]] = (elbg->utility[elbg->nearest_cb[i]] >= INT_MAX - best_dist) ?
+                INT_MAX : elbg->utility[elbg->nearest_cb[i]] + best_dist;
+                free_cells->index = i;
+                free_cells->next = elbg->cells[elbg->nearest_cb[i]];
+                elbg->cells[elbg->nearest_cb[i]] = free_cells;
+                free_cells++;
+                src += dim;
+            } // for i
+        } else { // dim == 4
+            for (i=0; i < numpoints; i++) {
+                int32x4_t i32x4_src, i32x4_dst, i32x4_result;
+                int dist, best_dist;
+                
+                dest = elbg->codebook;
+                //           best_dist = distance_limited(src, elbg->codebook + best_idx * dim, dim, INT_MAX);
+                best_dist = INT_MAX;
+                i32x4_src = vld1q_s32(src);
+                for (int k = 0; k < num_cb; k++) {
+                    //                int dist = distance_limited(src, dest, dim, best_dist);
+                    i32x4_dst = vld1q_s32(dest);
+                    i32x4_result = vsubq_s32(i32x4_src, i32x4_dst);
+                    i32x4_result = vmulq_s32(i32x4_result, i32x4_result);
+                    dist = vaddvq_s32(i32x4_result);
+                    if (dist < best_dist) {
+                        best_dist = dist;
+                        best_idx = k;
+                        if (best_dist == 0) { // can't be better than a perfect match
+                            k = num_cb; // break out of the loop
+                        }
+                    }
+                    dest += dim;
+                }
+                elbg->nearest_cb[i] = best_idx;
+                elbg->error = (elbg->error >= INT_MAX - best_dist) ? INT_MAX : elbg->error + best_dist;
+                elbg->utility[elbg->nearest_cb[i]] = (elbg->utility[elbg->nearest_cb[i]] >= INT_MAX - best_dist) ?
+                INT_MAX : elbg->utility[elbg->nearest_cb[i]] + best_dist;
+                free_cells->index = i;
+                free_cells->next = elbg->cells[elbg->nearest_cb[i]];
+                elbg->cells[elbg->nearest_cb[i]] = free_cells;
+                free_cells++;
+                src += dim;
+            } // for i
+        } // dim == 4
 
         do_shiftings(elbg);
 
